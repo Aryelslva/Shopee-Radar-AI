@@ -8,6 +8,9 @@ import html
 import re
 import urllib.request
 import urllib.error
+import threading
+import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -28,7 +31,75 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SHOPEE_APP_ID = os.getenv("SHOPEE_APP_ID")
 SHOPEE_SECRET = os.getenv("SHOPEE_SECRET")
 
+# Configuração do Asaas. Nesta etapa, o endpoint apenas recebe e valida
+# notificações; ainda não cria cobranças nem libera assinaturas.
+ASAAS_API_KEY = os.getenv("ASAAS_API_KEY")
+ASAAS_ENV = os.getenv("ASAAS_ENV", "sandbox").strip().lower()
+ASAAS_WEBHOOK_TOKEN = os.getenv("ASAAS_WEBHOOK_TOKEN", "")
+
 SHOPEE_API_URL = "https://open-api.affiliate.shopee.com.br/graphql"
+
+# Controle persistente do benefício gratuito (uma pesquisa por ID do Telegram).
+# Em produção, configure RADAR_DB_PATH para um caminho dentro do volume persistente
+# do Railway. Sem volume persistente, os dados podem ser perdidos em um redeploy.
+import sqlite3
+
+RADAR_DB_PATH = os.getenv("RADAR_DB_PATH", "radar_access.db")
+
+
+def iniciar_banco():
+    with sqlite3.connect(RADAR_DB_PATH) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS usuarios (
+                telegram_id INTEGER PRIMARY KEY,
+                pesquisa_gratis_usada INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        db.commit()
+
+
+def pesquisa_gratis_disponivel(telegram_id: int) -> bool:
+    with sqlite3.connect(RADAR_DB_PATH) as db:
+        db.execute(
+            "INSERT OR IGNORE INTO usuarios (telegram_id, pesquisa_gratis_usada) VALUES (?, 0)",
+            (telegram_id,),
+        )
+        linha = db.execute(
+            "SELECT pesquisa_gratis_usada FROM usuarios WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        return linha is not None and linha[0] == 0
+
+
+def consumir_pesquisa_gratis(telegram_id: int) -> bool:
+    # A atualização condicional evita que duas pesquisas simultâneas consumam
+    # duas vezes o benefício ou liberem duas pesquisas gratuitas.
+    with sqlite3.connect(RADAR_DB_PATH) as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "INSERT OR IGNORE INTO usuarios (telegram_id, pesquisa_gratis_usada) VALUES (?, 0)",
+            (telegram_id,),
+        )
+        cursor = db.execute(
+            "UPDATE usuarios SET pesquisa_gratis_usada = 1 "
+            "WHERE telegram_id = ? AND pesquisa_gratis_usada = 0",
+            (telegram_id,),
+        )
+        db.commit()
+        return cursor.rowcount == 1
+
+
+async def bloquear_sem_acesso(mensagem):
+    await mensagem.reply_text(
+        "🔒 Sua pesquisa gratuita já foi utilizada. "
+        "Escolha um plano para continuar usando o Shopee Radar AI.\n\n"
+        "📅 Mensal: R$ 19,90\n"
+        "📅 Trimestral: R$ 54,90\n"
+        "📅 Semestral: R$ 99,90\n"
+        "📅 Anual: R$ 179,90\n\n"
+        "A liberação automática pelo Asaas será ativada na etapa de integração dos pagamentos."
+    )
+
 
 
 def numero(valor):
@@ -335,6 +406,14 @@ async def executar_busca(update, context, termo, pagina=1):
             key=lambda p: (pontuar_relevancia(p, termo), p.get("_pontuacao", 0)),
             reverse=True,
         )
+        if pagina == 1 and context.user_data.get("radar_busca_gratuita_pendente"):
+            user_id = update.effective_user.id
+            if not consumir_pesquisa_gratis(user_id):
+                await bloquear_sem_acesso(chat)
+                context.user_data["radar_busca_gratuita_pendente"] = False
+                return
+            context.user_data["radar_busca_gratuita_pendente"] = False
+            context.user_data["radar_busca_gratuita_em_andamento"] = True
         await enviar_resultados(update, context, produtos, pagina,
                                 bool(resposta.get("pageInfo", {}).get("hasNextPage", False)))
     except Exception:
@@ -349,6 +428,11 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not termo:
         await update.effective_message.reply_text("🔎 Digite o produto que deseja pesquisar.\n\nExemplo: /buscar ferramentas")
         return
+    user_id = update.effective_user.id
+    if not pesquisa_gratis_disponivel(user_id):
+        await bloquear_sem_acesso(update.effective_message)
+        return
+    context.user_data["radar_busca_gratuita_pendente"] = True
     await executar_busca(update, context, termo, 1)
 
 
@@ -385,8 +469,12 @@ async def botoes_radar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        if termo:
+        if termo and context.user_data.get("radar_busca_gratuita_em_andamento"):
             await executar_busca(query, context, termo, pagina)
+        elif termo:
+            await query.message.reply_text(
+                "🔒 Para iniciar outra pesquisa, escolha um dos planos do Shopee Radar AI."
+            )
         return
     if dados.startswith("analisar:"):
         chave = dados.split(":", 1)[1]
@@ -425,6 +513,11 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🏆 Informe uma categoria para ver os melhores resultados da pesquisa.\nExemplo: /top ferramentas"
         )
         return
+    user_id = update.effective_user.id
+    if not pesquisa_gratis_disponivel(user_id):
+        await bloquear_sem_acesso(update.effective_message)
+        return
+    context.user_data["radar_busca_gratuita_pendente"] = True
     await executar_busca(update, context, termo, 1)
 
 
@@ -435,6 +528,70 @@ async def ajuda(
     await start(update, context)
 
 
+
+class AsaasWebhookHandler(BaseHTTPRequestHandler):
+    """Endpoint inicial do webhook Asaas; não altera acesso nem pagamentos."""
+
+    def do_GET(self):
+        if self.path.rstrip("/") == "/health":
+            self._responder(200, {"status": "ok", "service": "shopee-radar-ai"})
+        else:
+            self._responder(404, {"error": "not_found"})
+
+    def do_POST(self):
+        if self.path.rstrip("/") != "/webhooks/asaas":
+            self._responder(404, {"error": "not_found"})
+            return
+
+        if not ASAAS_WEBHOOK_TOKEN:
+            self._responder(503, {"error": "webhook_token_not_configured"})
+            return
+
+        token_recebido = self.headers.get("asaas-access-token", "")
+        if not hmac.compare_digest(token_recebido, ASAAS_WEBHOOK_TOKEN):
+            self._responder(401, {"error": "unauthorized"})
+            return
+
+        try:
+            tamanho = int(self.headers.get("Content-Length", "0"))
+            if tamanho <= 0 or tamanho > 1_000_000:
+                self._responder(400, {"error": "invalid_content_length"})
+                return
+            payload = json.loads(self.rfile.read(tamanho).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("O corpo precisa ser um objeto JSON.")
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._responder(400, {"error": "invalid_json"})
+            return
+
+        # Não registrar dados pessoais ou o conteúdo integral da cobrança.
+        evento = str(payload.get("event", "unknown"))[:100]
+        pagamento = payload.get("payment") or {}
+        pagamento_id = str(pagamento.get("id", "unknown"))[:100] if isinstance(pagamento, dict) else "unknown"
+        logging.info("Webhook Asaas recebido e autenticado: event=%s payment_id=%s", evento, pagamento_id)
+        self._responder(200, {"received": True, "processed": False})
+
+    def _responder(self, status, dados):
+        corpo = json.dumps(dados).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(corpo)))
+        self.end_headers()
+        self.wfile.write(corpo)
+
+    def log_message(self, formato, *args):
+        logging.info("HTTP webhook: " + formato, *args)
+
+
+def iniciar_servidor_webhook():
+    """Inicia o endpoint HTTP em paralelo ao polling do Telegram."""
+    porta = int(os.getenv("PORT", "8080"))
+    servidor = ThreadingHTTPServer(("0.0.0.0", porta), AsaasWebhookHandler)
+    thread = threading.Thread(target=servidor.serve_forever, name="asaas-webhook", daemon=True)
+    thread.start()
+    logging.info("Servidor HTTP ativo na porta %s; endpoint POST /webhooks/asaas", porta)
+    return servidor
+
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError(
@@ -442,6 +599,8 @@ def main():
             "Configure TELEGRAM_BOT_TOKEN no CMD."
         )
 
+    iniciar_banco()
+    servidor_webhook = iniciar_servidor_webhook()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -458,7 +617,11 @@ def main():
         else "ATENÇÃO: configure SHOPEE_APP_ID e SHOPEE_SECRET no CMD."
     )
 
-    app.run_polling()
+    try:
+        app.run_polling()
+    finally:
+        servidor_webhook.shutdown()
+        servidor_webhook.server_close()
 
 
 if __name__ == "__main__":
